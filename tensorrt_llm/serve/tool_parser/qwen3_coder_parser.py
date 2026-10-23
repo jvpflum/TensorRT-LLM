@@ -18,6 +18,7 @@
 import ast
 import html
 import json
+import math
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -33,6 +34,14 @@ from tensorrt_llm.serve.tool_parser.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+
+
+def _is_strict_json(value: Any) -> bool:
+    try:
+        json.dumps(value, allow_nan=False)
+        return True
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 class Qwen3CoderToolParser(BaseToolParser):
@@ -324,6 +333,20 @@ class Qwen3CoderToolParser(BaseToolParser):
         result = self._parse_streaming("", tools, complete=True)
         if not self._in_tool_call:
             result.normal_text += self._buf
+        elif self._function_name_sent:
+            # The stream ended inside a call (EOS after </function>, or max_tokens).
+            # Flush its parameters and close the arguments so clients get a JSON object.
+            param_config = self._get_arguments_config(self._current_function_name, tools)
+            function_end = self._buf.find("</function>")
+            body = self._buf if function_end == -1 else self._buf[:function_end]
+            result.calls.extend(self._parse_and_stream_parameters(body, param_config, complete=True))
+            current_streamed = self.streamed_args_for_tool[self.current_tool_id]
+            closing = "}" if current_streamed else "{}"
+            result.calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing)
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
+            self.current_tool_id += 1
         self._buf = ""
         self._reset_streaming_state()
         return result
@@ -376,7 +399,8 @@ class Qwen3CoderToolParser(BaseToolParser):
 
             else:
                 # Additional parameters - add them incrementally
-                new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
+                # Keep document order; a set would make the key order depend on the hash seed.
+                new_keys = [k for k in new_params if k not in self._current_parameters]
                 if new_keys:
                     # Build the continuation part (no closing brace yet)
                     continuation_parts = []
@@ -535,6 +559,7 @@ class Qwen3CoderToolParser(BaseToolParser):
         """Convert parameter value based on its type in the schema."""
         # Copy and modify from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
         param_value = html.unescape(param_value.strip())
+        raw_value = param_value
         if param_value.lower() == "null":
             return None
 
@@ -574,12 +599,15 @@ class Qwen3CoderToolParser(BaseToolParser):
         elif param_type.startswith("num") or param_type.startswith("float"):
             try:
                 float_param_value = float(param_value)
+                if not math.isfinite(float_param_value):
+                    # inf and nan are not valid JSON, and int(inf) raises OverflowError.
+                    raise ValueError(param_value)
                 return (
                     float_param_value
                     if float_param_value - int(float_param_value) != 0
                     else int(float_param_value)
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a float "
                     f"in tool '{func_name}', degenerating to string."
@@ -601,7 +629,10 @@ class Qwen3CoderToolParser(BaseToolParser):
             ):
                 try:
                     param_value = json.loads(param_value)
-                    return param_value
+                    if _is_strict_json(param_value):
+                        return param_value
+                    # json.loads accepts NaN and Infinity, which json.dumps would emit as invalid JSON.
+                    param_value = raw_value
                 except (json.JSONDecodeError, TypeError, ValueError):
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
@@ -614,4 +645,7 @@ class Qwen3CoderToolParser(BaseToolParser):
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
                     f"converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
                 )
+            if not _is_strict_json(param_value):
+                # literal_eval can return sets, bytes, complex or inf, which are not JSON.
+                return raw_value
             return param_value
